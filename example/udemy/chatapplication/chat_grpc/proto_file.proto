@@ -3,19 +3,16 @@ syntax  = "proto3";
 option go_package = "github.com/nguyentrunghieu15/redis-example/chat_proto";
 
 message Client {
-    string name = 1;
+    string id = 1;
 }
 
 message ClientMessage {
-    string name = 1;
+    string id = 1;
     string message = 2;
 }
 
-message ResponseJoinReq{
-    bool is_accept = 1;
-}
-
 service ChatService {
-    rpc ReqJoinChat (Client) returns (ResponseJoinReq);
-    rpc Chat(stream ClientMessage) returns (stream ClientMessage);
+    rpc ReqJoinChat (Client) returns (Client);
+    rpc ClientChat(stream ClientMessage) returns (Client);
+    rpc ServerChat(Client) returns (stream ClientMessage);
 }

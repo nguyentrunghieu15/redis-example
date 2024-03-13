@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
+	"time"
 
 	pb "github.com/nguyentrunghieu15/redis-example/example/udemy/chatapplication/chat_grpc"
 	"github.com/redis/go-redis/v9"
@@ -30,99 +32,102 @@ type ServerChat struct {
 	pb.ChatServiceServer
 }
 
+const charset = "abcdefghijklmnopqrstuvwxyz" +
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+var seededRand *rand.Rand = rand.New(
+	rand.NewSource(time.Now().UnixNano()))
+
+func StringWithCharset(length int, charset string) string {
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[seededRand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func String(length int) string {
+	return StringWithCharset(length, charset)
+}
+
 var redis_client = redis.NewClient(&redis.Options{
 	Addr:     REDIS_ADDR,
 	Password: REDIS_PASSWORD, // no password set
 	DB:       REDIS_DB,       // use default DB
 })
 
-func (s *ServerChat) ReqJoinChat(ctx context.Context, client *pb.Client) (*pb.ResponseJoinReq, error) {
-	log.Println("Invoke a client : ", client.Name)
-	res := redis_client.SAdd(context.Background(), REDIS_CLIENT, client.Name)
-	if res.Err() != nil {
-		log.Println("Server error: ", res.Err().Error())
-		return &pb.ResponseJoinReq{IsAccept: false}, res.Err()
-	}
-
-	if res.Val() == 0 {
-		return &pb.ResponseJoinReq{IsAccept: false}, nil
-	}
-	return &pb.ResponseJoinReq{IsAccept: true}, nil
+func (s *ServerChat) ReqJoinChat(ctx context.Context, client *pb.Client) (*pb.Client, error) {
+	log.Println("Invoke a client")
+	client_id := String(5)
+	redis_client.SAdd(context.Background(), REDIS_CLIENT, client_id)
+	return &pb.Client{Id: client_id}, nil
 }
 
-func (s *ServerChat) Chat(stream pb.ChatService_ChatServer) error {
+func (s *ServerChat) ClientChat(stream pb.ChatService_ClientChatServer) error {
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if !ok {
-		return status.Errorf(codes.DataLoss, "BidirectionalStreamingEcho: failed to get metadata")
+		return status.Errorf(codes.DataLoss, "ClientStreamingEcho: failed to get metadata")
 	}
-	var client_name string
-	if t, ok := md["client"]; ok {
-		client_name = t[0]
+	var id string
+	if t, ok := md["id"]; ok {
+		id = t[0]
 	}
-
-	isMember := redis_client.SIsMember(context.Background(), REDIS_CLIENT, client_name)
-	if !isMember.Val() {
-		return fmt.Errorf("Server rufuse your chat")
+	if r := redis_client.SIsMember(context.Background(), REDIS_CLIENT, id); r.Val() == false || r.Err() != nil {
+		return fmt.Errorf("Client didt regist")
 	}
-
-	defer func() {
-		redis_client.SRem(context.Background(), REDIS_CLIENT, client_name)
-	}()
-
-	var client = redis.NewClient(&redis.Options{
-		Addr:     REDIS_ADDR,
-		Password: REDIS_PASSWORD, // no password set
-		DB:       REDIS_DB,       // use default DB
-	})
-
-	sub := client.Subscribe(context.Background(), REDIS_CHANEL_NAME)
-	defer sub.Close()
-	c := make(chan byte, 0)
-	go func() {
-		for {
-			// Revice message from another
-			subres, suberr := sub.ReceiveMessage(context.Background())
-			if suberr != nil {
-				err := stream.Send(&pb.ClientMessage{Name: "Server", Message: suberr.Error()})
-				if err != nil {
-					log.Println("Error:", err)
-				}
-				break
-			} else {
-				mess := strings.Split(subres.Payload, ":")
-				if mess[0] == client_name {
-					continue
-				}
-				fmt.Printf("Server send for %s mess from %s: %s\n", client_name, mess[0], mess[1])
-				err := stream.Send(&pb.ClientMessage{Name: mess[0], Message: mess[1]})
-				if err != nil {
-					log.Println("Error:", err)
-					break
-				}
-			}
+	defer redis_client.SRem(context.Background(), REDIS_CLIENT, id)
+	for {
+		res, err := stream.Recv()
+		if err == io.EOF {
+			break
 		}
-	}()
-	go func() {
-		for {
-			res, err := stream.Recv()
-			if err == io.EOF {
-				close(c)
-				break
-			}
+
+		if err != nil {
+			return err
+		}
+		pub := redis_client.Publish(context.Background(), REDIS_CHANEL_NAME, fmt.Sprintf("%s:%s", res.GetId(), res.GetMessage()))
+		if pub.Err() != nil {
+			return fmt.Errorf("Error send message")
+		}
+	}
+	return nil
+}
+
+func (s *ServerChat) ServerChat(client *pb.Client, stream pb.ChatService_ServerChatServer) error {
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if !ok {
+		return fmt.Errorf("Can't auth connection")
+	}
+	clients, ok := md["id"]
+	if !ok {
+		return fmt.Errorf("Can't auth client func server chat")
+	}
+
+	client_id := clients[0]
+
+	if r := redis_client.SIsMember(context.Background(), REDIS_CLIENT, client_id); r.Val() == false || r.Err() != nil {
+		return fmt.Errorf("Client didt regist")
+	}
+	defer redis_client.SRem(context.Background(), REDIS_CLIENT, client_id)
+	sub := redis_client.Subscribe(context.Background(), REDIS_CHANEL_NAME)
+	for {
+		mess, err := sub.ReceiveMessage(context.Background())
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		payload := strings.Split(mess.Payload, ":")
+		id := payload[0]
+		text := payload[1]
+		if id != client_id {
+			err = stream.Send(&pb.ClientMessage{Id: id, Message: text})
 			if err != nil {
-				log.Println("Error: ", err)
-				close(c)
-				break
-			}
-			pub := redis_client.Publish(context.Background(), REDIS_CHANEL_NAME, fmt.Sprintf("%s:%s", res.Name, res.Message))
-
-			if pub.Val() == 0 {
-				stream.Send(&pb.ClientMessage{Name: "Server", Message: "Can't send message"})
-				break
+				return err
 			}
 		}
-	}()
-	<-c
+	}
 	return nil
 }
 
@@ -137,6 +142,7 @@ func main() {
 	}
 
 	redis_client.FlushDB(context.Background())
+	defer redis_client.ShutdownSave(context.Background())
 
 	defer lis.Close()
 	log.Println("Init server ", SERVER_ADDR)

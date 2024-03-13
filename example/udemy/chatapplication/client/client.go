@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	"time"
 
 	chat_proto "github.com/nguyentrunghieu15/redis-example/example/udemy/chatapplication/chat_grpc"
 	"google.golang.org/grpc"
@@ -16,18 +15,50 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-func toValidASCII(s string) string {
-	var result = []rune{}
-	for _, v := range s {
-		if (v >= 'a' && v <= 'z') || (v >= 'A' && v <= 'Z') || v == '_' || v == '.' || v == '-' {
-			result = append(result, v)
+func ClientChat(cc chat_proto.ChatServiceClient, id string, c chan (bool)) {
+	md := metadata.Pairs("id", id)
+	ctx := metadata.NewOutgoingContext(context.Background(), md)
+	stream, err := cc.ClientChat(ctx)
+	if err != nil {
+		log.Fatalln("Can't chat with server")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		text, _ := reader.ReadString('\n')
+		mess := strings.TrimFunc(text, func(r rune) bool {
+			return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '.' || r == '-' || r == '_')
+		})
+		err := stream.Send(&chat_proto.ClientMessage{Id: id, Message: mess})
+		if err != nil {
+			break
 		}
 	}
-	return string(result)
+	close(c)
+}
+
+func ServerChat(cc chat_proto.ChatServiceClient, id string, c chan (bool)) {
+	md := metadata.Pairs("id", id)
+	ctx := metadata.NewOutgoingContext(context.Background(), md)
+	stream, err := cc.ServerChat(ctx, &chat_proto.Client{Id: id})
+	if err != nil {
+		log.Fatalln("Error:", err)
+	}
+	for {
+		res, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalln("Error:", err)
+		}
+		fmt.Printf("%s:%s\n", res.GetId(), res.GetMessage())
+	}
+	close(c)
 }
 
 func main() {
 	addr := "localhost:5000"
+	// Client chat
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalln("Can't connect to server with error", err)
@@ -35,60 +66,30 @@ func main() {
 		log.Println("Connected to server")
 	}
 	defer conn.Close()
-	client := chat_proto.NewChatServiceClient(conn)
-	reader := bufio.NewReader(os.Stdin)
-	var name string
-	for {
-		fmt.Print("Enter your username: ")
-		name, _ = reader.ReadString('\n')
-		name = toValidASCII(strings.Trim(name, "\n"))
-		res, err := client.ReqJoinChat(context.Background(), &chat_proto.Client{Name: name})
-		if err != nil {
-			log.Fatal("Error:", err)
-		}
-		if !res.IsAccept {
-			fmt.Print("Your username is used\n")
-			continue
-		}
-		break
-	}
+	client_chat := chat_proto.NewChatServiceClient(conn)
 
-	md := metadata.Pairs("client", name)
-	ctx := metadata.NewOutgoingContext(context.Background(), md)
-	stream, err := client.Chat(ctx)
+	//Server chat
+	cc, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("failed to call server: %v\n", err)
+		log.Fatalln("Can't connect to server with error", err)
+	} else {
+		log.Println("Connected to server")
 	}
-	c := make(chan byte, 0)
+	defer conn.Close()
+	server_chat := chat_proto.NewChatServiceClient(cc)
 
-	go func() {
+	// Request join world chat
+	res, err := client_chat.ReqJoinChat(context.Background(), &chat_proto.Client{Id: ""})
+	if err != nil {
+		log.Fatal("Error:", err)
+	}
 
-		greet := []string{"Hi", "Im student", "Bye"}
-		for _, v := range greet {
-			err := stream.Send(&chat_proto.ClientMessage{Name: name, Message: v})
-			if err != nil {
-				stream.CloseSend()
-				break
-			}
-			time.Sleep(time.Second * 5)
-		}
-		stream.CloseSend()
-	}()
-	go func() {
-		for {
-			r, err := stream.Recv()
-			if err == io.EOF {
-				log.Fatalln("Server closed stream")
-				close(c)
-				break
-			}
-			if err != nil {
-				log.Fatalln("Error: ", err)
-				close(c)
-				break
-			}
-			fmt.Printf("%s:%s\n", r.Name, r.Message)
-		}
-	}()
+	// Your ID in world chat
+	id := res.GetId()
+	fmt.Println("Your id:", id)
+
+	c := make(chan (bool), 0)
+	go ClientChat(client_chat, id, c)
+	go ServerChat(server_chat, id, c)
 	<-c
 }
